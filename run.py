@@ -37,16 +37,28 @@ transToken = '<TRANS>'
 transTokenIdx = 4
 
 def perplexity(nmt, testEng, testBg, batchSize):
-    testSize = len(test)
-    H = 0.
-    c = 0
-    for b in range(0,testSize,batchSize):
-        batch = test[b:min(b+batchSize, testSize)]
-        l = sum(len(s)-1 for s in batch)
-        c += l
+    testSize = min(len(testEng), len(testBg))
+    total_loss = 0.0
+    total_words = 0
+    
+    nmt.eval()  # Set model to evaluation mode
+    
+    for b in range(0, testSize, batchSize):
+        eng_batch = testEng[b:min(b+batchSize, testSize)]
+        bg_batch = testBg[b:min(b+batchSize, testSize)]
+        
+        # Count total words (excluding padding and start tokens)
+        batch_words = sum(len(s)-1 for s in eng_batch) + sum(len(s)-1 for s in bg_batch)
+        total_words += batch_words
+        
         with torch.no_grad():
-            H += l * nmt(testEng, testBg)
-    return math.exp(H/c)
+            # Get combined loss from the model
+            loss = nmt(eng_batch, bg_batch)
+            total_loss += loss.item() * batch_words
+    
+    nmt.train()  # Set model back to training mode
+    return math.exp(total_loss/total_words)
+
 
 if len(sys.argv)>1 and sys.argv[1] == 'prepare':
     # trainCorpus, devCorpus, word2ind = utils.prepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, startToken, endToken, unkToken, padToken, transToken)
