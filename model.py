@@ -8,27 +8,27 @@
 ###
 #############################################################################
 
-import random
 import torch
 from torch import nn
 
 # Additive Attention
 class Attention(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, dropout):
         super(Attention, self).__init__()
         self.attn = nn.Linear(hidden_size * 2, hidden_size)
         self.v = nn.Linear(hidden_size, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, hidden, encoder_outputs, mask=None):
         # hidden: (batch_size, hidden_size)
         # encoder_outputs: (batch_size, seq_len, hidden_size)
 
         seq_len = encoder_outputs.shape[1]
-        hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)  # (batch_size, seq_len, hidden_size)
+        hidden = hidden.unsqueeze(1).expand(-1, seq_len, -1)  # (batch_size, seq_len, hidden_size)
 
         energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim = 2)))  # (batch_size, seq_len, hidden_size)
 
-        attention = self.v(energy).squeeze(2)  # (batch_size, seq_len)
+        attention = self.dropout(self.v(energy).squeeze(2))  # (batch_size, seq_len)
 
         if mask is not None:
             mask = mask.to(attention.device)
@@ -49,21 +49,12 @@ class Encoder(nn.Module):
         self.padTokenIdx = padTokenIdx
         self.num_layers = num_layers
 
-    def preparePaddedBatch(self, source):
-        device = next(self.parameters()).device
-        m = max(len(s) for s in source)
-        sents_padded = [s+(m-len(s))*[self.padTokenIdx] for s in source]
-        return torch.tensor(sents_padded, dtype=torch.long, device=device)	# shape=(batch_size, seq_len)
-
-    def forward(self, source):
+    def forward(self, X, source_lengths):
         # source: (batch_size, seq_len)
         # NOTE try dropuout here
 
-        source_lengths = [len(s) - 1 for s in source]
-        preparedData = self.preparePaddedBatch(source)
-
-        batch_size, seq_len = preparedData.shape
-        E = self.embedding(preparedData) # (batch_size, seq_len, embedding_size)
+        batch_size, seq_len = X.shape
+        E = self.embedding(X) # (batch_size, seq_len, embedding_size)
 
         packed = torch.nn.utils.rnn.pack_padded_sequence(E, source_lengths, batch_first = True, enforce_sorted=False)
 
@@ -74,19 +65,16 @@ class Encoder(nn.Module):
 
         output, _ = torch.nn.utils.rnn.pad_packed_sequence(outputPacked)  # (batch_size, seq_len, 2 * hidden_size)
 
-        # output = output.view(batch_size, seq_len, 2, self.hidden_size)
-
         t = self.projection(output)
 
         return t, hidden, cell
 
 class DecoderGenerator(nn.Module):
-    def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, encoder, padTokenIdx, mask):
+    def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, dropout_attention, padTokenIdx, mask):
         super(DecoderGenerator, self).__init__()
         self.vocab_size = vocab_size
-        self.attention = Attention(hidden_size)  # Use Attention
+        self.attention = Attention(hidden_size, dropout_attention)  # Use Attention
         self.embedding = nn.Embedding(vocab_size, embedding_size)
-        self.encoder = encoder
         self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, dropout=dropout, batch_first=True)
         self.fc = nn.Linear(2 * hidden_size, vocab_size)
         self.mask = mask
@@ -94,30 +82,23 @@ class DecoderGenerator(nn.Module):
         self.padTokenIdx = padTokenIdx
         self.num_layers = num_layers
 
-    def forward(self, src):
+    def forward(self, X, encoderOutputs):
         # src and trg is array not tensor
         # src: (batch_size, src_len)  - Input sequence
 
-        X = self.encoder.preparePaddedBatch(src)
         E = self.embedding(X[:, :-1]) # (batch_size, src_len, embedding_size)
 
         batch_size = X.shape[0]
         seq_len = X.shape[1]
-        seq_len_dec = seq_len - 1
 
         # packed = torch.nn.utils.rnn.pack_padded_sequence(E, [len(s) for s in src], enforce_sorted=False)
-
-        outputs = torch.zeros(batch_size, seq_len_dec, self.vocab_size).to(X.device)
-
-        encoder_outputs, _, _ = self.encoder(src)
-
-        encoder_outputs.transpose_(0, 1)  # (seq_len, batch_size, 2 * hidden_size)
 
         hidden = torch.randn(self.num_layers, batch_size, self.hidden_size).to(X.device) * 0.01
         cell = torch.randn(self.num_layers, batch_size, self.hidden_size).to(X.device) * 0.01
 
+        totalLoss = 0
 
-        for t in range(seq_len_dec):
+        for t in range(seq_len - 1):
             # packed = torch.nn.utils.rnn.pack_sequence([E[:, t, :] for t in range(seq_len)], enforce_sorted=False)
             input_step = E[:, t].unsqueeze(1)  # (batch_size, 1, embedding_size)
 
@@ -128,10 +109,10 @@ class DecoderGenerator(nn.Module):
 
             hidden_attention = hidden[-1] if self.num_layers > 1 else hidden.squeeze(0)  # (batch_size, hidden_size)
 
-            att = self.attention(hidden_attention, encoder_outputs, self.mask[t, :seq_len_dec])  # (batch_size, seq_len)
+            att = self.attention(hidden_attention, encoderOutputs, self.mask[t, :seq_len - 1])  # (batch_size, seq_len)
             att = att.transpose(0, 1)  # (batch_size, 1, seq_len)
 
-            weighted = torch.bmm(att, encoder_outputs)  # (batch_size, 1, hidden_size)
+            weighted = torch.bmm(att, encoderOutputs)  # (batch_size, 1, hidden_size)
 
             # Prediction
             output = output.squeeze(1)  # (batch_size, hidden_size)
@@ -139,52 +120,37 @@ class DecoderGenerator(nn.Module):
             # output = torch.nn.utils.rnn.pad_packed_sequence(output)
             output = self.fc(torch.cat((output, weighted), dim=1)) # (batch_size, vocab_size)
 
-            outputs[:, t] = output  # Store prediction
+            totalLoss += nn.functional.cross_entropy(output, X[:, t + 1], ignore_index=self.padTokenIdx)
 
-        # Calculate loss
-        Z = outputs.view(-1, self.vocab_size)
-        Y_bar = X[:, 1:].reshape(-1) # Targets are shifted right
-
-        # Z = outputs.flatten(0, 1) # (batch_size * src_len, vocab_size)
-        # Y_bar = X[1:].flatten(0, 1) # (batch_size * src_len)
-
-        return nn.functional.cross_entropy(Z,Y_bar,ignore_index=self.padTokenIdx)
+        return totalLoss / seq_len - 1
 
 
 class DecoderTranslator(nn.Module):
-    def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, encoder, padTokenIdx):
+    def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, dropout_attention, padTokenIdx):
         super(DecoderTranslator, self).__init__()
         self.vocab_size = vocab_size
-        self.attention = Attention(hidden_size)  # Use Attention
+        self.attention = Attention(hidden_size, dropout_attention)  # Use Attention
         self.num_layers = num_layers
-        self.encoder = encoder
         self.embedding = nn.Embedding(vocab_size, embedding_size)
         self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, dropout=dropout, batch_first=True)
         self.fc = nn.Linear(2 * hidden_size, vocab_size)
         self.padTokenIdx = padTokenIdx
         self.hidden_size = hidden_size
 
-    def forward(self, source, target):
+    def forward(self, X, encoderOutputs):
 
-        X = self.encoder.preparePaddedBatch(target)
         E = self.embedding(X[:, :-1]) # (batch_size, src_len, embedding_size)
 
         batch_size, seq_len = X.shape
 
-        encoderOutputs, _, _ = self.encoder(source)
-
-        encoderOutputs.transpose_(0, 1)  # (seq_len, batch_size, 2 * hidden_size)
-
-        # packed = torch.nn.utils.rnn.pack_padded_sequence(E, [len(s) for s in source], enforce_sorted=False)
-
         hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(X.device)
         cell = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(X.device)
 
-        outputs = torch.zeros(batch_size, seq_len - 1, self.vocab_size).to(X.device)
+        totalLoss = 0
 
         for t in range(seq_len - 1):
             input_step = E[:, t].unsqueeze(1)  # (batch_size, 1, embedding_size) - Current input
-            # packed = torch.nn.utils.rnn.pack_sequence([E[:, t, :] for t in range(seq_len)], enforce_sorted=False)
+
             output, (hidden, cell) = self.rnn(input_step, (hidden, cell))
             # output: (batch_size, 1, hidden_size)
 
@@ -199,20 +165,18 @@ class DecoderTranslator(nn.Module):
 
             # Prediction
             output = output.squeeze(1)  # (batch_size, hidden_size)
-            # output = torch.nn.utils.rnn.pad_packed_sequence(output)
+
             weighted = weighted.squeeze(1)  # (batch_size, hidden_size)
             prediction = self.fc(torch.cat((output, weighted), dim=1)) # (batch_size, vocab_size)
-            outputs[:, t] = prediction  # Store prediction
 
-                # Calculate loss
-        Z = outputs.view(-1, self.vocab_size)
-        Y_bar = X[:, 1:].contiguous().view(-1)  # Targets are shifted right
+            totalLoss += nn.functional.cross_entropy(prediction, X[:, t + 1], ignore_index=self.padTokenIdx)
 
-        # prediction = torch.softmax(value, dim = 1)  # (batch_size, vocab_size)
-        return nn.functional.cross_entropy(Z, Y_bar, ignore_index=self.padTokenIdx)
+        return totalLoss / seq_len - 1
 
 class LanguageModel(torch.nn.Module):
-    def __init__(self, embed_size, hidden_size, word2ind, unkToken, padToken, endToken, transToken, lstm_layers, dropout, maxlen=1000):
+    def __init__(self, embed_size, hidden_size, word2ind, unkToken, padToken, endToken, transToken,
+                  lstm_layers, dropout_encoder, dropout_translator, dropaut_generator, 
+                  dropout_attention, maxlen=1000):
         super(LanguageModel, self).__init__()
         self.word2ind = word2ind
         self.padTokenIdx = word2ind[padToken]
@@ -223,14 +187,21 @@ class LanguageModel(torch.nn.Module):
         pos = torch.arange(maxlen)
         self.mask = pos.unsqueeze(0) > pos.unsqueeze(1)
 
-        self.encoder = Encoder(len(word2ind), embed_size, hidden_size, lstm_layers, dropout, self.padTokenIdx)
-        self.transltor = DecoderTranslator(len(word2ind), embed_size, hidden_size, lstm_layers, dropout, self.encoder, self.padTokenIdx)
-        self.generator = DecoderGenerator(len(word2ind), embed_size, hidden_size, lstm_layers, dropout, self.encoder, self.padTokenIdx, self.mask)
+        self.encoder = Encoder(len(word2ind), embed_size, hidden_size, lstm_layers, dropout_encoder, self.padTokenIdx)
+        self.transltor = DecoderTranslator(len(word2ind), embed_size, hidden_size, lstm_layers, dropout_translator, dropout_attention, self.padTokenIdx)
+        self.generator = DecoderGenerator(len(word2ind), embed_size, hidden_size, lstm_layers, dropaut_generator, dropout_attention, self.padTokenIdx, self.mask)
         self.lossFn = nn.CrossEntropyLoss(ignore_index = self.padTokenIdx)
+        self.dropout = nn.Dropout(dropout_encoder)
 
         # task weights (learnable parameters)
         self.task_weights = nn.Parameter(torch.ones(2).to(next(self.parameters()).device))
         self.prev_losses = [1.0, 1.0]  # Initialize with 1.0 to avoid division by zero
+
+    def preparePaddedBatch(self, source):
+        device = next(self.parameters()).device
+        m = max(len(s) for s in source)
+        sents_padded = [s+(m-len(s))*[self.padTokenIdx] for s in source]
+        return torch.tensor(sents_padded, dtype=torch.long, device=device)	# shape=(batch_size, seq_len)
 
     def save(self,fileName):
         torch.save(self.state_dict(), fileName)
@@ -239,9 +210,19 @@ class LanguageModel(torch.nn.Module):
         self.load_state_dict(torch.load(fileName))
 
     def forward(self, engBatch, bgBatch):
+        engBatchPadded = self.preparePaddedBatch(engBatch)
+        bgBatchPadded = self.preparePaddedBatch(bgBatch)
+
+        engLength = [len(s) - 1 for s in engBatch]
+
+        encoderOutputs, _, _ = self.encoder(engBatchPadded, engLength)
+        encoderOutputs.transpose_(0, 1)  # (seq_len, batch_size, 2 * hidden_size)
+
+        encoderOutputs = self.dropout(encoderOutputs)
+
         # Current losses
-        L1 = self.generator(engBatch)  # Generation loss
-        L2 = self.transltor(engBatch, bgBatch)  # Translation loss
+        L1 = self.generator(engBatchPadded, encoderOutputs)  # Generation loss
+        L2 = self.transltor(bgBatchPadded, encoderOutputs)  # Translation loss
 
         # Calculate relative inverse training rates
         r1 = L1.item() / self.prev_losses[0]

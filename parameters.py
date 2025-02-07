@@ -30,6 +30,11 @@ test_every = 2000
 emd_size = 256
 hidden_size = 512
 lstm_layers = 2
-dropout = 0.5
+
+dropout_encoder = 0.5
+dropout_translator = 0.5
+dropaut_generator = 0.5
+dropout_attention = 0.5
+
 
 # dropout Text generation
