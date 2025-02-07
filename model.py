@@ -171,7 +171,7 @@ class DecoderTranslator(nn.Module):
             totalLoss += nn.functional.cross_entropy(prediction, X[:, t + 1], ignore_index=self.padTokenIdx)
 
         return totalLoss / (seq_len - 1) if seq_len > 1 else totalLoss
-        
+
 class LanguageModel(torch.nn.Module):
     def __init__(self, embed_size, hidden_size, word2ind, unkToken, padToken, endToken, transToken,
                   lstm_layers, dropout_encoder, dropout_translator, dropaut_generator, 
