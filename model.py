@@ -119,9 +119,9 @@ class DecoderGenerator(nn.Module):
             # output = torch.nn.utils.rnn.pad_packed_sequence(output)
             output = self.fc(torch.cat((output, weighted), dim=1)) # (batch_size, vocab_size)
 
-            totalLoss += nn.functional.cross_entropy(output, X[:, t + 1], ignore_index=self.padTokenIdx)
+            totalLoss += nn.functional.cross_entropy(output, X[:, t], ignore_index=self.padTokenIdx)
 
-        return totalLoss / seq_len - 1
+        return totalLoss / (seq_len - 1) if seq_len > 1 else totalLoss
 
 
 class DecoderTranslator(nn.Module):
@@ -168,10 +168,10 @@ class DecoderTranslator(nn.Module):
             weighted = weighted.squeeze(1)  # (batch_size, hidden_size)
             prediction = self.fc(torch.cat((output, weighted), dim=1)) # (batch_size, vocab_size)
 
-            totalLoss += nn.functional.cross_entropy(prediction, X[:, t + 1], ignore_index=self.padTokenIdx)
+            totalLoss += nn.functional.cross_entropy(prediction, X[:, t], ignore_index=self.padTokenIdx)
 
-        return totalLoss / seq_len - 1
-
+            return totalLoss / (seq_len - 1) if seq_len > 1 else totalLoss
+        
 class LanguageModel(torch.nn.Module):
     def __init__(self, embed_size, hidden_size, word2ind, unkToken, padToken, endToken, transToken,
                   lstm_layers, dropout_encoder, dropout_translator, dropaut_generator, 
