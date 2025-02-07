@@ -233,9 +233,8 @@ class LanguageModel(torch.nn.Module):
         w2 = self.task_weights[1] * (r2 / r_mean)
 
         # Normalize weights
-        total = w1 + w2
-        w1 = w1 / total
-        w2 = w2 / total
+        weights = torch.softmax(torch.stack([w1, w2]), dim=0)
+        w1, w2 = weights[0], weights[1]
 
         # Update task weights
         self.task_weights.data = torch.tensor([w1, w2]).to(self.task_weights.device)
