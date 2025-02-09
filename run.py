@@ -21,20 +21,20 @@ import utils
 import model
 from parameters import *
 
-startToken = '<S>'
+startToken = '<s>'
 startTokenIdx = 0
 
-endToken = '</S>'
+endToken = '</s>'
 endTokenIdx = 1
 
-unkToken = '<UNK>'
+unkToken = '<unk>'
 unkTokenIdx = 2
 
-padToken = '<PAD>'
+padToken = '<pad>'
 padTokenIdx = 3
 
-transToken = '<TRANS>'
-transTokenIdx = 4
+# transToken = '<TRANS>'
+# transTokenIdx = 4
 
 def perplexity(nmt, testEng, testBg, batchSize):
     testSize = min(len(testEng), len(testBg))
@@ -61,31 +61,29 @@ def perplexity(nmt, testEng, testBg, batchSize):
 
 
 if len(sys.argv)>1 and sys.argv[1] == 'prepare':
-    # trainCorpus, devCorpus, word2ind = utils.prepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, startToken, endToken, unkToken, padToken, transToken)
-    # trainCorpus = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in trainCorpus ]
-    # devCorpus = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in devCorpus ]
-    # pickle.dump((trainCorpus, devCorpus), open(corpusFileName, 'wb'))
-    # pickle.dump(word2ind, open(wordsFileName, 'wb'))
+    def get_word2ind(sp_model):
+        """Returns a dictionary mapping subwords to their indices."""
+        word2ind = {sp_model.id_to_piece(i): i for i in range(sp_model.get_piece_size())}
+        return word2ind
 
-    trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng, word2ind = utils.prepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, startToken, endToken, unkToken, padToken, transToken)
-    trainCorpusBg = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in trainCorpusBg ]
-    trainCorpusEng = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in trainCorpusEng ]
-    devCorpusBg = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in devCorpusBg ]
-    devCorpusEng = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in devCorpusEng ]
+    trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng, sp_source, sp_target = utils.prepareDataBPE(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, bpe_Eng, bpe_Bg)
+    word2indBg = get_word2ind(sp_target)
+    word2indEng = get_word2ind(sp_source)
 
     pickle.dump((trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng), open(corpusFileName, 'wb'))
-    pickle.dump(word2ind, open(wordsFileName, 'wb'))
+    pickle.dump((word2indEng, word2indBg), open(wordsFileName, 'wb'))
 
     print('Data prepared.')
 
+
 if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
-    # (trainCorpus,devCorpus) = pickle.load(open(corpusFileName, 'rb'))
     (trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng) = pickle.load(open(corpusFileName, 'rb'))
 
-    word2ind = pickle.load(open(wordsFileName, 'rb'))
+    word2indEng, word2indBg = pickle.load(open(wordsFileName, 'rb'))
 
-    nmt = model.LanguageModel(emd_size, hidden_size, word2ind, unkToken, padToken, endToken,
-                              lstm_layers, dropout).to(device)
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
+                        endToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
     optimizer = torch.optim.Adam(nmt.parameters(), lr=learning_rate)
 
     if sys.argv[1] == 'extratrain':
@@ -151,26 +149,29 @@ if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
 if len(sys.argv)>3 and sys.argv[1] == 'perplexity':
     word2ind = pickle.load(open(wordsFileName, 'rb'))
     
-    nmt = model.LanguageModel(parameter1, parameter2, parameter3, parameter4).to(device)
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
+                        endToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
     nmt.load(modelFileName)
     
     sourceTest = utils.readCorpus(sys.argv[2])
     targetTest = utils.readCorpus(sys.argv[3])
-    test = [ [startToken] + s + [transToken] + t + [endToken] for (s,t) in zip(sourceTest,targetTest)]
-    test = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in test ]
+    testEng = [ [startToken] + s + [endToken] for s in sourceTest]
+    testBg = [ [startToken] + s + [endToken] for s in targetTest]
 
     nmt.eval()
-    print('Model perplexity: ', perplexity(nmt, test, batchSize))
+    print('Model perplexity: ', perplexity(nmt, testEng, testBg, batchSize))
 
 if len(sys.argv)>3 and sys.argv[1] == 'translate':
     word2ind = pickle.load(open(wordsFileName, 'rb'))
     words = list(word2ind)
 
     sourceTest = utils.readCorpus(sys.argv[2])
-    test = [ [startToken] + s + [transToken] for s in sourceTest ]
-    test = [ [word2ind.get(w,unkTokenIdx) for w in s] for s in test ]
+    test = [ [startToken] + s + [endToken] for s in sourceTest ]
 
-    nmt = model.LanguageModel(parameter1, parameter2, parameter3, parameter4).to(device)
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
+                        endToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
     nmt.load(modelFileName)
 
     nmt.eval()
@@ -179,26 +180,23 @@ if len(sys.argv)>3 and sys.argv[1] == 'translate':
     pb.start(len(test))
     for s in test:
         r=nmt.generate(s)
-        st = r.index(transTokenIdx)
-        result = [words[i] for i in r[st+1:-1]]
-        file.write(' '.join(result)+"\n")
+        file.write(' '.join(r)+"\n")
         pb.tick()
     pb.stop()
 
 if len(sys.argv)>2 and sys.argv[1] == 'generate':
-    word2ind = pickle.load(open(wordsFileName, 'rb'))
-    words = list(word2ind)
+    word2indEng, word2indBg = pickle.load(open(wordsFileName, 'rb'))
 
-    test = sys.argv[2].split()
-    test = [word2ind.get(w,unkTokenIdx) for w in test]
+    test = sys.argv[2]
 
-    nmt = model.LanguageModel(parameter1, parameter2, parameter3, parameter4).to(device)
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
+                        endToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
     nmt.load(modelFileName)
 
     nmt.eval()
     r=nmt.generate(test)
-    result = [words[i] for i in r]
-    print(' '.join(result)+"\n")
+    print(' '.join(r)+"\n")
 
 if len(sys.argv)>3 and sys.argv[1] == 'bleu':
     ref = [[s] for s in utils.readCorpus(sys.argv[2])]
