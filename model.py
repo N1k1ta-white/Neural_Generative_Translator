@@ -32,10 +32,9 @@ class Attention(nn.Module):
 
         attention = self.v(energy).squeeze(2)  # (batch_size, seq_len)
 
-        att = attention.masked_fill(mask == 0, -1e10)
+        attention = attention.masked_fill(mask == 0, -1e10)
 
-        att = torch.softmax(attention, dim=1)  # (batch_size, seq_len)
-        return att
+        return torch.softmax(attention, dim=1)  # (batch_size, seq_len)
 
 class Encoder(nn.Module):
     def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, padTokenIdx):
@@ -49,21 +48,7 @@ class Encoder(nn.Module):
         self.num_layers = num_layers
         self.fc = nn.Linear(hidden_size * 2, hidden_size)
 
-    def forward(self, X, source_lengths):
-        # source: (batch_size, seq_len)
-
-        E = self.dropout(self.embedding(X)) # (batch_size, seq_len, embedding_size)
-
-        packed = torch.nn.utils.rnn.pack_padded_sequence(E, source_lengths, batch_first = True, enforce_sorted=False)
-
-        outputPacked, (hidden, cell) = self.rnn(packed)  # outputPacked: (batch_size, seq_len, 2 * hidden_size)
-        #outputPacked is a packed sequence containing all hidden states
-        #hidden is now from the final non-padded element in the batch
-
-        output, _ = torch.nn.utils.rnn.pad_packed_sequence(outputPacked)  # (batch_size, seq_len, 2 * hidden_size)
-
-        # hidden (2 * num_layers, batch_size, hidden_size)
-
+    def transformStates(self, hidden, cell):
         combined_hidden = []
         combined_cell = []
         for layer in range(self.num_layers):
@@ -78,9 +63,31 @@ class Encoder(nn.Module):
             combined_cell.append(combined_c)
 
         # Stack to [num_layers, batch_size, hidden_size]
-        hidden = torch.stack(combined_hidden, dim=0)
-        cell = torch.stack(combined_cell, dim=0)
+        return (torch.stack(combined_hidden, dim=0), torch.stack(combined_cell, dim=0))
+    
+    def executeThrowRnn(self, X, source_lengths):
+        E = self.dropout(self.embedding(X)) # (batch_size, seq_len, embedding_size)
 
+        packed = torch.nn.utils.rnn.pack_padded_sequence(E, source_lengths, batch_first = True, enforce_sorted=False)
+
+        outputPacked, (hidden, cell) = self.rnn(packed)  # outputPacked: (batch_size, seq_len, 2 * hidden_size)
+
+        output, _ = torch.nn.utils.rnn.pad_packed_sequence(outputPacked)  # (batch_size, seq_len, 2 * hidden_size)
+
+        return output, (hidden, cell)
+
+    def forward(self, X, source_lengths):
+        # source: (batch_size, seq_len)
+        
+        output, (hidden, cell) = self.executeThrowRnn(X, source_lengths)
+        # hidden (2 * num_layers, batch_size, hidden_size)
+
+        (hidden, cell) = self.transformStates(hidden, cell)
+        return output, (hidden, cell)
+        
+    def forward_step(self, x, hidden, cell):
+        e = self.dropout(self.embedding(x))
+        output, (hidden, cell) = self.rnn(e, (hidden, cell))
         return output, (hidden, cell)
 
 class Decoder(nn.Module):
@@ -111,8 +118,6 @@ class Decoder(nn.Module):
 
         att = att.unsqueeze(1)  # (batch_size, 1, seq_len)
 
-        encoder_outputs.permute(1, 0, 2)  # (seq_len, batch_size, hidden_size * 2)
-
         weighted = torch.bmm(att, encoder_outputs)  # (batch_size, 1, hidden_size * 2)
 
         weighted = weighted.permute(1, 0, 2)  # (1, batch_size, hidden_size * 2)
@@ -126,15 +131,15 @@ class Decoder(nn.Module):
 
         #output = [seq len, batch size, dec hid dim * n directions]
         #hidden = [n layers * n directions, batch size, dec hid dim]
-        
+
         e = e.squeeze(0)
         output = output.squeeze(0)
         weighted = weighted.squeeze(0)
-        
+
         prediction = self.fc(torch.cat((output, weighted, e), dim = 1))
 
         #prediction = [batch size, output dim]
-        
+
         return prediction, hidden.squeeze(0), cell.squeeze(0)
 
 class Seq2Seq(nn.Module):
@@ -143,45 +148,45 @@ class Seq2Seq(nn.Module):
         self.decoder = decoder
         self.src_pad_idx = src_pad_idx
         self.loss = nn.CrossEntropyLoss(ignore_index = src_pad_idx)
-                
-    def forward(self, trg, encoder_outputs, hidden, cell, mask, teacher_forcing_ratio = 0.75):
+
+    def forward(self, trg, encoder_outputs, hidden, cell, mask, teacher_forcing_ratio = 0.3):
         #src = [batch_size, src_len]
         #src_len = [batch_size]
         #trg = [batch_size, trg_len]
         #teacher_forcing_ratio is probability to use teacher forcing
         #e.g. if teacher_forcing_ratio is 0.75 we use teacher forcing 75% of the time
-                    
+
         batch_size, trg_len = trg.shape
         trg_vocab_size = self.decoder.vocab_size
-        
+
         #tensor to store decoder outputs
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(trg.device)
-        
+
         #encoder_outputs is all hidden states of the input sequence, back and forwards
         #hidden is the final forward and backward hidden states, passed through a linear layer
-                
-        #first input to the decoder is the <sos> tokens
+
+        #first input to the decoder is the <s> tokens
         input = trg[:, 0]
-                
+
         for t in range(1, trg_len):
-            #insert input token embedding, previous hidden state, all encoder hidden states 
+            #insert input token embedding, previous hidden state, all encoder hidden states
             #  and mask
             #receive output tensor (predictions) and new hidden state
             output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs, mask)
-            
+
             #place predictions in a tensor holding predictions for each token
             outputs[:, t] = output
-            
+
             #decide if we are going to use teacher forcing or not
             teacher_force = random.random() < teacher_forcing_ratio
-            
+
             #get the highest predicted token from our predictions
-            top1 = output.argmax(1) 
-            
+            top1 = output.argmax(1)
+
             #if teacher forcing, use actual next token as next input
             #if not, use predicted token
             input = trg[:, t] if teacher_force else top1
-            
+
         return self.loss(outputs.view(-1, trg_vocab_size), trg.view(-1))
 
 class TextGenerator(nn.Module):
@@ -195,34 +200,37 @@ class TextGenerator(nn.Module):
         new_mask = mask.clone()
         new_mask[:, t:] = False
         return new_mask
-    
+
     def forward(self, src, encoder_outputs, hidden, cell, mask):
-        #src = [batch_size, src_len]
-        #src_len = [batch_size]
+        # src : (batch_size, src_len)
+        # src_len : (batch_size)
 
         batch_size, src_len = src.shape
         vocab_size = self.decoder.vocab_size
-        
+
         #tensor to store decoder outputs
         outputs = torch.zeros(batch_size, src_len, vocab_size).to(src.device)
 
-        #first input to the decoder is the <sos> tokens
+        #first input to the decoder is the <s> tokens
         input = src[:, 0]
-                        
+
         for t in range(1, src_len):
-            temp_mask = self.create_temp_mask(mask, t)
-            #insert input token embedding, previous hidden state, all encoder hidden states 
+            temp_mask = self.create_temp_mask(mask, t - 1)
+            #insert input token embedding, previous hidden state, all encoder hidden states
             #  and mask
             #receive output tensor (predictions) and new hidden state
             output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs, temp_mask)
-            
+
             #place predictions in a tensor holding predictions for each token
             outputs[:, t] = output
-            
+            input = src[:, t]
+
+        #outputs = [batch_size, src_len, vocab_size]
+
         return self.loss(outputs.view(-1, vocab_size), src.view(-1))
 
 class LanguageModel(torch.nn.Module):
-    def __init__(self, embed_size, hidden_size, word2indEng, word2indBg, startToken, unkToken, padToken, endToken,
+    def __init__(self, embed_size, hidden_size, word2indEng, word2indBg, startToken, unkToken, padToken, endToken, transToken,
                   lstm_layers, dropout_encoder, dropout_translator, dropaut_generator, maxlen=1000):
         super(LanguageModel, self).__init__()
         self.word2indBg = word2indBg
@@ -231,15 +239,13 @@ class LanguageModel(torch.nn.Module):
         self.padTokenIdx = word2indBg[padToken]
         self.endTokenIdx = word2indBg[endToken]
         self.unkTokenIdx = word2indBg[unkToken]
-
-        pos = torch.arange(maxlen)
-        self.mask = pos.unsqueeze(0) > pos.unsqueeze(1)
+        self.transToken = transToken
 
         self.encoder = Encoder(len(word2indEng), embed_size, hidden_size, lstm_layers, dropout_encoder, self.padTokenIdx)
         self.attention = Attention(hidden_size)
         self.DecoderTransltor = Decoder(len(word2indBg), embed_size, hidden_size, lstm_layers, dropout_translator, self.attention)
         self.DecoderGenerator = Decoder(len(word2indEng), embed_size, hidden_size, lstm_layers, dropaut_generator, self.attention)
-        
+
         self.Seq2Seq = Seq2Seq(self.DecoderTransltor, self.padTokenIdx)
         self.TextGenerator = TextGenerator(self.DecoderGenerator, self.padTokenIdx)
 
@@ -259,11 +265,8 @@ class LanguageModel(torch.nn.Module):
     def save(self,fileName):
         torch.save(self.state_dict(), fileName)
 
-    def load(self,fileName):
-        self.load_state_dict(torch.load(fileName))
-
-    # def load(self,fileName, map_location):
-    #     self.load_state_dict(torch.load(fileName, map_location))
+    def load(self,fileName, map_location = torch.device("cuda:0")):
+        self.load_state_dict(torch.load(fileName, map_location))
 
     def create_mask(self, src):
         mask = (src != self.padTokenIdx)
@@ -282,8 +285,11 @@ class LanguageModel(torch.nn.Module):
 
         mask = self.create_mask(engBatchPadded)
 
+        hiddenGen = torch.zeros_like(hidden)
+        cellGen= torch.zeros_like(cell)
+
         # Current losses
-        L1 = self.TextGenerator(engBatchPadded, encoder_outputs, hidden, cell, mask)  # Generation loss
+        L1 = self.TextGenerator(engBatchPadded, encoder_outputs, hiddenGen, cellGen, mask)  # Generation loss
         L2 = self.Seq2Seq(bgBatchPadded, encoder_outputs, hidden, cell, mask)  # Translation loss
 
         # Calculate relative inverse training rates
@@ -307,127 +313,109 @@ class LanguageModel(torch.nn.Module):
 
         # Return weighted sum of losses
         return w1 * L1 + w2 * L2
+    
+    def isCompleteSentence(self, prefix):
+        return self.transToken in prefix
+    
+    def generate(self, prefix, temperature = 0.5, max_len=1000):
+        spEng = spm.SentencePieceProcessor(model_file=bpe_Eng)
 
+        device = next(self.parameters()).device
 
-    # def isSourceSentenceComplete(self, sentence):
-    #     return sentence.endswith(endToken)
+        tokens = [self.startTokenIdx] + spEng.encode(prefix, out_type=int)
 
-    # def generate(self, prefix, temperature=0.1, limit=1000):
-    #     """
-    #     Generate text continuation from a given prefix
-    #     Args:
-    #         prefix (list): List of tokens (words/indices) to start generation from
-    #         limit (int): Maximum length of generated sequence
-    #     Returns:
-    #         list: Generated sequence of tokens
-    #     """
+        src_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
+        src_len = torch.tensor([len(tokens) - 1], dtype=torch.long, device=device)
 
-    #     spEng = spm.SentencePieceProcessor(model_file=bpe_Eng)
-    #     spBg = spm.SentencePieceProcessor(model_file=bpe_Bg)
+        generated = []
+        self.eval()
 
+        with torch.no_grad():
+            encoder_outputs, (hiddenEn, cellEn) = self.encoder.executeThrowRnn(src_tensor, src_len)
+            encoder_outputs = encoder_outputs.transpose(1, 0)
+            mask = self.create_mask(src_tensor)
 
-    #     self.eval()  # Set model to evaluation mode
-    #     with torch.no_grad():
-    #         device = next(self.parameters()).device
-    #         source = prefix
-    #         prefix = [self.startTokenIdx] + spEng.encode(prefix, out_type=int) + [self.endTokenIdx]
-    #         print(prefix)
+            num_layers, batch, size = hiddenEn.shape
 
-    #         # if not self.isSourceSentenceComplete(source):
-    #         #     prefix_tensor = torch.tensor([prefix], dtype=torch.long, device=device)
+            hidden = torch.zeros(num_layers // 2, batch, size, device=device)
+            cell = torch.zeros(num_layers // 2, batch, size, device=device)
 
-    #         #     # Initialize generation with the prefix
-    #         #     generated = prefix.copy()
-    #         #     current_input = prefix_tensor
+            input = src_tensor[:, 0].to(device)
 
-    #         #     hidden = torch.zeros(self.transltor.num_layers, 1, self.transltor.hidden_size).to(device)
-    #         #     cell = torch.zeros(self.transltor.num_layers, 1, self.transltor.hidden_size).to(device)
+            for t in range(1, len(tokens)):
+                temp_mask = self.TextGenerator.create_temp_mask(mask, t - 1)
+                output, hidden, cell = self.TextGenerator.decoder(input, hidden, cell, 
+                                                                   encoder_outputs, temp_mask)
+                input = src_tensor[:, t]
 
-    #         #     self.generator.eval()  # Set generator to evaluation mode
+            prediction = torch.softmax(output / temperature, dim=-1)
+            input = torch.multinomial(prediction, 1)
+            input.squeeze(1)
+            next_token = input.item()
 
-    #         #     encoder_outputs, hiddenEn, cellEn = self.encoder(prefix_tensor, [len(prefix) - 1])
-    #         #     encoder_outputs.transpose_(0, 1)  # (seq_len, batch_size, hidden_size)
+            print(next_token)
 
-    #         #     output, (hidden, cell) = self.generator.rnn(
-    #         #         self.generator.embedding(current_input[:, :-1]), (hidden, cell))
+            for t in range(1, max_len):
+                # Stop if END token is generated
+                if next_token == self.endTokenIdx:
+                    break
+                #insert input token embedding, previous hidden state, all encoder hidden states
+                #  and mask
+                #receive output tensor (predictions) and new hidden state
+                encoder_output, hiddenEn, cellEn = self.encoder.forward_step(input, hiddenEn, cellEn)
+                encoder_outputs = torch.cat(encoder_outputs, encoder_output, dim = 1)
+                mask = (encoder_outputs != None)
+                output, hidden, cell = self.Seq2Seq.decoder(input, hidden, cell, encoder_outputs, mask)
 
-    #         #     # Generate tokens until END token or limit is reached
-    #         #     for i in range(limit - len(prefix)):
+                prediction = torch.softmax(output / temperature, dim=-1)
 
-    #         #         # Get embeddings
-    #         #         emb = self.generator.embedding(current_input[:, -1:])  # Use last token as input
+                input = torch.multinomial(prediction, 1)
+                input = input.squeeze(1)
 
-    #         #         # Run through RNN
-    #         #         output, (hidden, cell) = self.generator.rnn(emb, (hidden, cell))
+                # Get next token
+                next_token = input.item()
+                generated.append(next_token)
 
-    #         #         # Apply attention
-    #         #         hidden_attention = hidden[-1] if self.generator.num_layers > 1 else hidden.squeeze(0)
-    #         #         att = self.generator.attention(hidden_attention, encoder_outputs)
-    #         #         att = att.unsqueeze(1)
-    #         #         weighted = torch.bmm(att, encoder_outputs)
+        self.train()
+        return spEng.decode(generated)
 
-    #         #         # Get prediction
-    #         #         output = output.squeeze(1)
-    #         #         weighted = weighted.squeeze(1)
-    #         #         prediction = self.generator.fc(torch.cat((output, weighted), dim=1))
-    #         #         prediction = torch.softmax(prediction / temperature, dim=-1)
+    def translate(self, prefix, temperature = 0.5, max_len = 1000):
+        spEng = spm.SentencePieceProcessor(model_file=bpe_Eng)
+        spBg = spm.SentencePieceProcessor(model_file=bpe_Bg)
+        device = next(self.parameters()).device
 
-    #         #         # Get next token
-    #         #         next_token = torch.multinomial(prediction, 1).item()
-    #         #         generated.append(next_token)
+        tokens = [self.startTokenIdx] + spEng.encode(prefix, out_type=int) + [self.endTokenIdx]
 
-    #         #         # Stop if END token is generated
-    #         #         if next_token == self.endTokenIdx:
-    #         #             break
+        src_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
+        src_len = torch.tensor([len(tokens) - 1], dtype=torch.long, device=device)
 
-    #         #         # Update current input for next iteration
-    #         #         current_input = torch.tensor([[next_token]], dtype=torch.long, device=device)
-    #         #         prefix_tensor = torch.cat((prefix_tensor, current_input), dim=1)
-    #         #         encoderOutput, hiddenEn, cellEn = self.encoder.forwardStep(current_input, hiddenEn, cellEn)
-    #         #         encoder_outputs = torch.cat((encoder_outputs, encoderOutput), dim=1)
+        generated = []
+        self.eval()
+        with torch.no_grad():
+            encoder_outputs, (hidden, cell) = self.encoder(src_tensor, src_len)
+            encoder_outputs = encoder_outputs.transpose(1, 0)
+            mask = self.create_mask(src_tensor)
 
-    #         #     prefix = generated.copy()
+            input = torch.tensor([self.startTokenIdx], dtype=torch.long, device=device)
 
-    #         encoderOutputs, _, _ = self.encoder(
-    #             torch.tensor([prefix], dtype=torch.long, device=device), [len(prefix) - 1])
-    #         encoderOutputs = encoderOutputs.transpose(0, 1)
+            for t in range(1, max_len):
+                #insert input token embedding, previous hidden state, all encoder hidden states
+                #  and mask
+                #receive output tensor (predictions) and new hidden state
+                output, hidden, cell = self.Seq2Seq.decoder(input, hidden, cell, encoder_outputs, mask)
 
-    #         hidden = torch.zeros(self.DecoderTransltor.num_layers, 1, self.DecoderTransltor.hidden_size).to(device)
-    #         cell = torch.zeros(self.DecoderTransltor.num_layers, 1, self.DecoderTransltor.hidden_size).to(device)
-    #         translated = []
+                prediction = torch.softmax(output / temperature, dim=-1)
 
-    #         current_input = torch.tensor([[self.startTokenIdx]], dtype=torch.long, device=device)
+                input = torch.multinomial(prediction, 1)
+                input = input.squeeze(1)
 
-    #         for t in range(limit - len(translated)):
+                # Get next token
+                next_token = input.item()
+                generated.append(next_token)
 
-    #             output, (hidden, cell) = self.DecoderTransltor.rnn(self.DecoderTransltor.embedding(current_input), (hidden, cell))
-    #             # output: (1, 1, hidden_size)
+                # Stop if END token is generated
+                if next_token == self.endTokenIdx:
+                    break
 
-    #             hidden_attention = hidden[-1] if self.DecoderTransltor.num_layers > 1 else hidden.squeeze(0)  # (1, hidden_size)
-
-    #             # Attention
-    #             att = self.DecoderTransltor.attention(hidden_attention, encoderOutputs)  # (1, seq_len)
-
-    #             att = att.unsqueeze(1)  # (1, 1, seq_len)
-
-    #             weighted = torch.bmm(att, encoderOutputs)  # (1, 1, hidden_size)
-
-    #             # Prediction
-    #             output = output.squeeze(1)  # (batch_size, hidden_size)
-
-    #             weighted = weighted.squeeze(1)  # (batch_size, hidden_size)
-    #             prediction = self.DecoderTransltor.fc(torch.cat((output, weighted), dim=1)) # (batch_size, vocab_size)
-    #             prediction = torch.softmax(prediction / temperature, dim=-1)
-
-    #             current_input = torch.multinomial(prediction, 1)
-
-    #             if current_input.item() == self.endTokenIdx:
-    #                 break
-
-    #             translated.append(current_input.item())
-
-    #     resultGen = spEng.decode(prefix)
-    #     resultTranslate = spBg.decode(translated)
-
-    #     self.train()  # Set model back to training mode
-    #     return resultGen, resultTranslate
+        self.train()
+        return spBg.decode(generated)

@@ -33,8 +33,8 @@ unkTokenIdx = 2
 padToken = '<pad>'
 padTokenIdx = 3
 
-# transToken = '<TRANS>'
-# transTokenIdx = 4
+transToken = '<trans>'
+transTokenIdx = 4
 
 def perplexity(nmt, testEng, testBg, batchSize):
     testSize = min(len(testEng), len(testBg))
