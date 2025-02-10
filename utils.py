@@ -12,29 +12,7 @@ import sys
 import random
 import nltk
 from nltk.translate.bleu_score import corpus_bleu
-
-import sentencepiece as spm
-import os
-
 nltk.download('punkt')
-
-def train_bpe(corpus_file, model_prefix, vocab_size=8000):
-    """Тренирует BPE и сохраняет модель."""
-    if not os.path.exists(f"{model_prefix}.model"):
-        spm.SentencePieceTrainer.train(
-            input=corpus_file,
-            model_prefix=model_prefix,
-            vocab_size=vocab_size,
-            character_coverage=1.0,
-            model_type="bpe",
-            bos_id=0,
-            eos_id=1,
-            unk_id=2,
-            pad_id=3,
-        )
-
-# train_bpe(bg, "bul", 40000)
-# train_bpe(eng, "eng", 30000)
 
 class progressBar:
     def __init__(self ,barWidth = 50):
@@ -59,7 +37,7 @@ def readCorpus(fileName):
     ### fileName е името на файла, съдържащ корпуса
     ### връща списък от изречения, като всяко изречение е списък от думи
     print('Loading file:',fileName)
-    return [ nltk.word_tokenize(line) for line in open(fileName, 'r', encoding='utf-8') ]
+    return [ nltk.word_tokenize(line) for line in open(fileName) ]
 
 def getDictionary(corpus, startToken, endToken, unkToken, padToken, transToken, wordCountThreshold = 2):
     dictionary={}
@@ -71,24 +49,6 @@ def getDictionary(corpus, startToken, endToken, unkToken, padToken, transToken, 
     words = [startToken, endToken, unkToken, padToken, transToken] + [w for w in sorted(dictionary) if dictionary[w] > wordCountThreshold]
     return { w:i for i,w in enumerate(words)}
 
-
-def MyPrepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, startToken, endToken, unkToken, padToken, transToken):
-    sourceCorpus = readCorpus(sourceFileName)
-    targetCorpus = readCorpus(targetFileName)
-    word2indEng = getDictionary(sourceCorpus, startToken, endToken, unkToken, padToken, transToken)
-    word2indBg = getDictionary(targetCorpus, startToken, endToken, unkToken, padToken, transToken)
-
-    trainCorpusBg = [ [startToken] + s + [endToken] for s in targetCorpus]
-    trainCorpusEn = [ [startToken] + s + [endToken] for s in sourceCorpus]
-
-    sourceDev = readCorpus(sourceDevFileName)
-    targetDev = readCorpus(targetDevFileName)
-
-    devCorpusBg = [ [startToken] + s + [endToken] for s in targetDev]
-    devCorpusEn = [ [startToken] + s + [endToken] for s in sourceDev]
-
-    print('Corpus loading completed.')
-    return trainCorpusBg, trainCorpusEn, devCorpusBg, devCorpusEn, word2indEng, word2indBg
 
 def prepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, startToken, endToken, unkToken, padToken, transToken):
 
@@ -105,39 +65,3 @@ def prepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFile
 
     print('Corpus loading completed.')
     return trainCorpus, devCorpus, word2ind
-
-def load_bpe(model_path):
-    """Загружает обученную BPE-модель."""
-    sp = spm.SentencePieceProcessor()
-    sp.load(model_path)
-    return sp
-
-def encode_bpe(sp, sentences):
-    """Токенизирует текст в индексы с помощью BPE."""
-    return [sp.encode(s, out_type=int) for s in sentences]
-
-def listComprehension(nested_list):
-  flattened_list = [item for sublist in nested_list for item in sublist]
-  return flattened_list
-
-def prepareDataBPE(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, bpe_model_source, bpe_model_target, startTokenIdx=0, endTokenIdx=1):
-    """Подготавливает данные с BPE-токенизацией."""
-    sourceCorpus = readCorpus(sourceFileName)
-    targetCorpus = readCorpus(targetFileName)
-
-    # Загружаем BPE модели
-    sp_source = load_bpe(bpe_model_source)
-    sp_target = load_bpe(bpe_model_target)
-
-    # Токенизируем данные
-    trainCorpusEng = [[startTokenIdx] + listComprehension(s) + [endTokenIdx] for s in encode_bpe(sp_source, sourceCorpus)]
-    trainCorpusBg = [[startTokenIdx] + listComprehension(s) + [endTokenIdx] for s in encode_bpe(sp_target, targetCorpus)]
-
-    sourceDev = readCorpus(sourceDevFileName)
-    targetDev = readCorpus(targetDevFileName)
-
-    devCorpusEng = [[startTokenIdx] + listComprehension(s) + [endTokenIdx] for s in encode_bpe(sp_source, sourceDev)]
-    devCorpusBg = [[startTokenIdx] + listComprehension(s) + [endTokenIdx] for s in encode_bpe(sp_target, targetDev)]
-
-    print('Corpus loading and BPE encoding completed.')
-    return trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng, sp_source, sp_target
