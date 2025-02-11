@@ -18,12 +18,12 @@ import sentencepiece as spm
 class Attention(nn.Module):
     def __init__(self, hidden_size):
         super(Attention, self).__init__()
-        self.attn = nn.Linear((hidden_size * 2) + hidden_size, hidden_size)
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
         self.v = nn.Linear(hidden_size, 1, bias=False)
 
     def forward(self, hidden, encoder_outputs, mask=None):
         # hidden: (batch_size, hidden_size)
-        # encoder_outputs: (batch_size, seq_len, hidden_size * 2)
+        # encoder_outputs: (batch_size, seq_len, hidden_size)
 
         seq_len = encoder_outputs.shape[1]
         hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)  # (batch_size, seq_len, hidden_size)
@@ -35,7 +35,6 @@ class Attention(nn.Module):
         attention = attention.masked_fill(mask == 0, -1e10)
 
         return torch.softmax(attention, dim=1)  # (batch_size, seq_len)
-
 class Encoder(nn.Module):
     def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, padTokenIdx):
         super(Encoder, self).__init__()
@@ -97,8 +96,8 @@ class Decoder(nn.Module):
         self.attention = attention
         self.num_layers = num_layers
         self.embedding = nn.Embedding(vocab_size, emb_size)
-        self.rnn = nn.LSTM((hidden_size * 2) + emb_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear((hidden_size * 2) + hidden_size + emb_size, vocab_size)
+        self.rnn = nn.LSTM(hidden_size + emb_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size + emb_size, vocab_size)
         self.hidden_size = hidden_size
         self.dropout = nn.Dropout(dropout)
 
@@ -108,21 +107,23 @@ class Decoder(nn.Module):
         # encoders_outputs (batch_size, seq_len - 1, hidden_size * 2)
         # mask (seq_len ,batch_size)
 
+        enc_output = encoder_outputs[:, :, :hidden_size] + encoder_outputs[:, :, hidden_size:] # (batch_size, seq_len, hidden_size)
+
         x = x.unsqueeze(0)  # (1, batch_size)
 
         e = self.dropout(self.embedding(x)) # (1, batch_size, embedding_size)
 
         hidden_attention = hidden[-1] if self.num_layers > 1 else hidden.squeeze(0)  # (batch_size, hidden_size)
 
-        att = self.attention(hidden_attention, encoder_outputs, mask)  # (batch_size, seq_len)
+        att = self.attention(hidden_attention, enc_output, mask)  # (batch_size, seq_len)
 
         att = att.unsqueeze(1)  # (batch_size, 1, seq_len)
 
-        weighted = torch.bmm(att, encoder_outputs)  # (batch_size, 1, hidden_size * 2)
+        weighted = torch.bmm(att, enc_output)  # (batch_size, 1, hidden_size)
 
-        weighted = weighted.permute(1, 0, 2)  # (1, batch_size, hidden_size * 2)
+        weighted = weighted.permute(1, 0, 2)  # (1, batch_size, hidden_size)
 
-        rnn_input = torch.cat((e, weighted), dim=2)  # (1, batch_size, hidden_size * 2 + embedding_size)
+        rnn_input = torch.cat((e, weighted), dim=2)  # (1, batch_size, hidden_size + embedding_size)
 
         rnn_input = rnn_input.transpose(1, 0)
 
@@ -136,7 +137,7 @@ class Decoder(nn.Module):
         output = output.squeeze(0)
         weighted = weighted.squeeze(0)
 
-        prediction = self.fc(torch.cat((output, weighted, e), dim = 1))
+        prediction = self.fc(torch.cat((torch.mul(output, weighted), e), dim = 1))
 
         #prediction = [batch size, output dim]
 
@@ -256,13 +257,11 @@ class LanguageModel(torch.nn.Module):
         self.task_weights = nn.Parameter(torch.ones(2).to(device))
         self.prev_losses = [torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)]
 
-    def preparePaddedBatch(self, sourceEng, sourceBg):
+    def preparePaddedBatch(self, source):
         device = next(self.parameters()).device
-        m = max(len(s) for s in sourceEng)
-        m = max(m, max(len(s) for s in sourceBg))
-        sents_paddedEng = [s+(m-len(s))*[self.padTokenIdx] for s in sourceEng]
-        sents_paddedBg = [s + (m - len(s))*[self.padTokenIdx] for s in sourceBg]
-        return torch.tensor(sents_paddedEng, dtype=torch.long, device=device), torch.tensor(sents_paddedBg, dtype=torch.long, device=device)	# shape=(batch_size, seq_len)
+        m = max(len(s) for s in source)
+        sents_padded = [s + (m - len(s))*[self.padTokenIdx] for s in source]
+        return torch.tensor(sents_padded, dtype=torch.long, device=device)	# shape=(batch_size, seq_len)
 
     def save(self,fileName):
         torch.save(self.state_dict(), fileName)
@@ -275,7 +274,8 @@ class LanguageModel(torch.nn.Module):
         return mask[:, 1:]         #mask = [batch size, src len]
 
     def forward(self, engBatch, bgBatch):
-        engBatchPadded, bgBatchPadded = self.preparePaddedBatch(engBatch, bgBatch)
+        engBatchPadded = self.preparePaddedBatch(engBatch)
+        bgBatchPadded = self.preparePaddedBatch(bgBatch)
 
         engLength = [len(s) - 1 for s in engBatch]
 
@@ -348,8 +348,16 @@ class LanguageModel(torch.nn.Module):
                 output, hidden, cell = self.TextGenerator.decoder(input, hidden, cell,
                                                                    encoder_outputs, temp_mask)
                 input = src_tensor[:, t]
-            
+
+            prediction = torch.softmax(output / temperature, dim=-1)
+            input = torch.multinomial(prediction, 1)
+            input = input.squeeze(1)
+            next_token = input.item()
+
             for t in range(1, max_len):
+                # Stop if END token is generated
+                if next_token == self.endTokenIdx:
+                    break
                 #insert input token embedding, previous hidden state, all encoder hidden states
                 #  and mask
                 #receive output tensor (predictions) and new hidden state
@@ -362,16 +370,10 @@ class LanguageModel(torch.nn.Module):
 
                 input = torch.multinomial(prediction, 1)
                 input = input.squeeze(1)
-                
-                  # Stop if END token is generated
-                if next_token == self.endTokenIdx:
-                    break
 
                 # Get next token
                 next_token = input.item()
                 generated.append(next_token)
-
-                
 
         self.train()
         return prefix + spEng.decode(generated)
