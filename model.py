@@ -35,12 +35,12 @@ class Attention(nn.Module):
         attention = attention.masked_fill(mask == 0, -1e10)
 
         return torch.softmax(attention, dim=1)  # (batch_size, seq_len)
+
 class Encoder(nn.Module):
     def __init__(self, vocab_size, embedding_size, hidden_size, num_layers, dropout, padTokenIdx):
         super(Encoder, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=padTokenIdx)
         self.dropout = nn.Dropout(dropout)
-        # GRU layer (bidirectional)
         self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.hidden_size = hidden_size
         self.padTokenIdx = padTokenIdx
@@ -107,7 +107,7 @@ class Decoder(nn.Module):
         # encoders_outputs (batch_size, seq_len - 1, hidden_size * 2)
         # mask (seq_len ,batch_size)
 
-        enc_output = encoder_outputs[:, :, :hidden_size] + encoder_outputs[:, :, hidden_size:] # (batch_size, seq_len, hidden_size)
+        enc_output = encoder_outputs[:, :, :self.hidden_size] + encoder_outputs[:, :, self.hidden_size:] # (batch_size, seq_len, hidden_size)
 
         x = x.unsqueeze(0)  # (1, batch_size)
 
@@ -130,62 +130,42 @@ class Decoder(nn.Module):
         output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))  # output: (batch_size, 1, hidden_size)
         output = output.transpose(1, 0)
 
-        #output = [seq len, batch size, dec hid dim * n directions]
-        #hidden = [n layers * n directions, batch size, dec hid dim]
-
         e = e.squeeze(0)
         output = output.squeeze(0)
         weighted = weighted.squeeze(0)
 
         prediction = self.fc(torch.cat((torch.mul(output, weighted), e), dim = 1))
 
-        #prediction = [batch size, output dim]
+        # prediction : (batch_size, vocab_size)
 
         return prediction, hidden.squeeze(0), cell.squeeze(0)
 
 class Seq2Seq(nn.Module):
-    def __init__(self, decoder, src_pad_idx):
+    def __init__(self, decoder, padTokenIdx):
         super(Seq2Seq, self).__init__()
         self.decoder = decoder
-        self.src_pad_idx = src_pad_idx
-        self.loss = nn.CrossEntropyLoss(ignore_index = src_pad_idx)
+        self.padTokenIdx = padTokenIdx
+        self.loss = nn.CrossEntropyLoss(ignore_index = padTokenIdx)
 
     def forward(self, trg, encoder_outputs, hidden, cell, mask, teacher_forcing_ratio = 0.3):
-        #src = [batch_size, src_len]
-        #src_len = [batch_size]
-        #trg = [batch_size, trg_len]
-        #teacher_forcing_ratio is probability to use teacher forcing
-        #e.g. if teacher_forcing_ratio is 0.75 we use teacher forcing 75% of the time
+        # trg = [batch_size, trg_len]
 
         batch_size, trg_len = trg.shape
         trg_vocab_size = self.decoder.vocab_size
 
-        #tensor to store decoder outputs
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(trg.device)
 
-        #encoder_outputs is all hidden states of the input sequence, back and forwards
-        #hidden is the final forward and backward hidden states, passed through a linear layer
-
-        #first input to the decoder is the <s> tokens
         input = trg[:, 0]
 
         for t in range(1, trg_len):
-            #insert input token embedding, previous hidden state, all encoder hidden states
-            #  and mask
-            #receive output tensor (predictions) and new hidden state
             output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs, mask)
 
-            #place predictions in a tensor holding predictions for each token
             outputs[:, t] = output
 
-            #decide if we are going to use teacher forcing or not
             teacher_force = random.random() < teacher_forcing_ratio
 
-            #get the highest predicted token from our predictions
             top1 = output.argmax(1)
 
-            #if teacher forcing, use actual next token as next input
-            #if not, use predicted token
             input = trg[:, t] if teacher_force else top1
 
         return self.loss(outputs.view(-1, trg_vocab_size), trg.view(-1))
@@ -209,24 +189,18 @@ class TextGenerator(nn.Module):
         batch_size, src_len = src.shape
         vocab_size = self.decoder.vocab_size
 
-        #tensor to store decoder outputs
         outputs = torch.zeros(batch_size, src_len, vocab_size).to(src.device)
 
-        #first input to the decoder is the <s> tokens
         input = src[:, 0]
 
         for t in range(1, src_len):
             temp_mask = self.create_temp_mask(mask, t - 1)
-            #insert input token embedding, previous hidden state, all encoder hidden states
-            #  and mask
-            #receive output tensor (predictions) and new hidden state
             output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs, temp_mask)
 
-            #place predictions in a tensor holding predictions for each token
             outputs[:, t] = output
             input = src[:, t]
 
-        #outputs = [batch_size, src_len, vocab_size]
+        # outputs : (batch_size, src_len, vocab_size)
 
         return self.loss(outputs.view(-1, vocab_size), src.view(-1))
 
@@ -271,7 +245,7 @@ class LanguageModel(torch.nn.Module):
 
     def create_mask(self, src):
         mask = (src != self.padTokenIdx)
-        return mask[:, 1:]         #mask = [batch size, src len]
+        return mask[:, 1:]         # (batch_size, seq_len)
 
     def forward(self, engBatch, bgBatch):
         engBatchPadded = self.preparePaddedBatch(engBatch)
@@ -317,8 +291,15 @@ class LanguageModel(torch.nn.Module):
 
     def isCompleteSentence(self, prefix):
         return self.transToken in prefix
+    
+    def genereate(self, prefix, temperature = 0.5):
+        if (self.isCompleteSentence(prefix)):
+            return self.translate(prefix.replace(self.word2indBg[self.transTokenIdx], ""), temperature)
+        else:
+            return self.translate(self.completeSentence(prefix, temperature).replace(
+                self.word2indBg[self.endTokenIdx]))
 
-    def generate(self, prefix, temperature = 0.5, max_len=1000):
+    def completeSentence(self, prefix, temperature = 0.5, max_len=1000):
         spEng = spm.SentencePieceProcessor(model_file=bpe_Eng)
 
         device = next(self.parameters()).device
@@ -355,12 +336,9 @@ class LanguageModel(torch.nn.Module):
             next_token = input.item()
 
             for t in range(1, max_len):
-                # Stop if END token is generated
                 if next_token == self.endTokenIdx:
                     break
-                #insert input token embedding, previous hidden state, all encoder hidden states
-                #  and mask
-                #receive output tensor (predictions) and new hidden state
+
                 encoder_output, (hiddenEn, cellEn) = self.encoder.forward_step(input.unsqueeze(1), hiddenEn, cellEn)
                 encoder_outputs = torch.cat((encoder_outputs, encoder_output), dim = 1)
                 mask = torch.cat((mask, torch.tensor([[True]], device=device)), dim = 1)
@@ -371,7 +349,6 @@ class LanguageModel(torch.nn.Module):
                 input = torch.multinomial(prediction, 1)
                 input = input.squeeze(1)
 
-                # Get next token
                 next_token = input.item()
                 generated.append(next_token)
 
@@ -398,9 +375,6 @@ class LanguageModel(torch.nn.Module):
             input = torch.tensor([self.startTokenIdx], dtype=torch.long, device=device)
 
             for t in range(1, max_len):
-                #insert input token embedding, previous hidden state, all encoder hidden states
-                #  and mask
-                #receive output tensor (predictions) and new hidden state
                 output, hidden, cell = self.Seq2Seq.decoder(input, hidden, cell, encoder_outputs, mask)
 
                 prediction = torch.softmax(output / temperature, dim=-1)
@@ -408,11 +382,9 @@ class LanguageModel(torch.nn.Module):
                 input = torch.multinomial(prediction, 1)
                 input = input.squeeze(1)
 
-                # Get next token
                 next_token = input.item()
                 generated.append(next_token)
 
-                # Stop if END token is generated
                 if next_token == self.endTokenIdx:
                     break
 

@@ -19,7 +19,6 @@ import os
 nltk.download('punkt')
 
 def train_bpe(corpus_file, model_prefix, vocab_size=8000):
-    """Тренирует BPE и сохраняет модель."""
     if not os.path.exists(f"{model_prefix}.model"):
         spm.SentencePieceTrainer.train(
             input=corpus_file,
@@ -32,6 +31,17 @@ def train_bpe(corpus_file, model_prefix, vocab_size=8000):
             unk_id=2,
             pad_id=3,
         )
+
+
+def get_word2ind(sp_model):
+    trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng, sp_source, sp_target = prepareDataBPE(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, bpe_Eng, bpe_Bg)
+    word2indBg = get_word2ind(sp_target)
+    word2indEng = get_word2ind(sp_source)
+
+    pickle.dump((trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng), open(corpusFileName, 'wb'))
+    pickle.dump((word2indEng, word2indBg), open(wordsFileName, 'wb'))
+
+    print('Data prepared.')
 
 # train_bpe(bg, "bul", 40000)
 # train_bpe(eng, "eng", 30000)
@@ -71,7 +81,6 @@ def getDictionary(corpus, startToken, endToken, unkToken, padToken, transToken, 
     words = [startToken, endToken, unkToken, padToken, transToken] + [w for w in sorted(dictionary) if dictionary[w] > wordCountThreshold]
     return { w:i for i,w in enumerate(words)}
 
-
 def MyPrepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, startToken, endToken, unkToken, padToken, transToken):
     sourceCorpus = readCorpus(sourceFileName)
     targetCorpus = readCorpus(targetFileName)
@@ -107,13 +116,11 @@ def prepareData(sourceFileName, targetFileName, sourceDevFileName, targetDevFile
     return trainCorpus, devCorpus, word2ind
 
 def load_bpe(model_path):
-    """Загружает обученную BPE-модель."""
     sp = spm.SentencePieceProcessor()
     sp.load(model_path)
     return sp
 
 def encode_bpe(sp, sentences):
-    """Токенизирует текст в индексы с помощью BPE."""
     return [sp.encode(s, out_type=int) for s in sentences]
 
 def listComprehension(nested_list):
@@ -121,15 +128,12 @@ def listComprehension(nested_list):
   return flattened_list
 
 def prepareDataBPE(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, bpe_model_source, bpe_model_target, startTokenIdx=0, endTokenIdx=1):
-    """Подготавливает данные с BPE-токенизацией."""
     sourceCorpus = readCorpus(sourceFileName)
     targetCorpus = readCorpus(targetFileName)
 
-    # Загружаем BPE модели
     sp_source = load_bpe(bpe_model_source)
     sp_target = load_bpe(bpe_model_target)
 
-    # Токенизируем данные
     trainCorpusEng = [[startTokenIdx] + listComprehension(s) + [endTokenIdx] for s in encode_bpe(sp_source, sourceCorpus)]
     trainCorpusBg = [[startTokenIdx] + listComprehension(s) + [endTokenIdx] for s in encode_bpe(sp_target, targetCorpus)]
 

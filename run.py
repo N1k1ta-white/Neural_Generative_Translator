@@ -21,6 +21,8 @@ import utils
 import model
 from parameters import *
 
+import csv
+
 startToken = '<s>'
 startTokenIdx = 0
 
@@ -41,22 +43,20 @@ def perplexity(nmt, testEng, testBg, batchSize):
     total_loss = 0.0
     total_words = 0
     
-    nmt.eval()  # Set model to evaluation mode
+    nmt.eval()
     
     for b in range(0, testSize, batchSize):
         eng_batch = testEng[b:min(b+batchSize, testSize)]
         bg_batch = testBg[b:min(b+batchSize, testSize)]
         
-        # Count total words (excluding padding and start tokens)
         batch_words = sum(len(s)-1 for s in eng_batch) + sum(len(s)-1 for s in bg_batch)
         total_words += batch_words
         
         with torch.no_grad():
-            # Get combined loss from the model
             loss = nmt(eng_batch, bg_batch)
             total_loss += loss.item() * batch_words
     
-    nmt.train()  # Set model back to training mode
+    nmt.train()
     return math.exp(total_loss/total_words)
 
 
@@ -78,12 +78,10 @@ if len(sys.argv)>1 and sys.argv[1] == 'prepare':
 
 if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
     (trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng) = pickle.load(open(corpusFileName, 'rb'))
-
-    word2indEng, word2indBg = pickle.load(open(wordsFileName, 'rb'))
-
-    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
-                        endToken, lstm_layers, dropout_encoder,
-                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
+    (word2indEng, word2indBg) = pickle.load(open(wordsFileName, 'rb'))
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, startToken, unkToken, padToken,
+                        endToken, transToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator).to(device)
     optimizer = torch.optim.Adam(nmt.parameters(), lr=learning_rate)
 
     if sys.argv[1] == 'extratrain':
@@ -93,6 +91,9 @@ if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
         for param_group in optimizer.param_groups:
             param_group['lr'] = learning_rate
     else:
+        with open(log_filename, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Iteration', 'Epoch', 'Batch', 'Loss', 'Words/sec', 'Time elapsed', 'Best Perplexity'])
         bestPerplexity = math.inf
         iter = 0
 
@@ -104,14 +105,13 @@ if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
         words = 0
         trainTime = time.time()
         for b in range(0, len(idx), batchSize):
-			#############################################################################
-			### Може да се наложи да се променя скоростта на спускане learning_rate в зависимост от итерацията
-			#############################################################################
+    #############################################################################
+    ### Може да се наложи да се променя скоростта на спускане learning_rate в зависимост от итерацията
+    #############################################################################
             iter += 1
             batchEng = [ trainCorpusEng[i] for i in idx[b:min(b+batchSize, len(idx))] ]
             batchBg = [ trainCorpusBg[i] for i in idx[b:min(b+batchSize, len(idx))] ]
 
-            
             words += sum( len(s)-1 for s in batchEng ) + sum( len(s)-1 for s in batchBg )
             H = nmt(batchEng, batchBg)
             optimizer.zero_grad()
@@ -120,9 +120,14 @@ if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
             optimizer.step()
             if iter % log_every == 0:
                 print("Iteration:",iter,"Epoch:",epoch+1,'/',maxEpochs,", Batch:",b//batchSize+1, '/', len(idx) // batchSize+1, ", loss: ",H.item(), "words/sec:",words / (time.time() - trainTime), "time elapsed:", (time.time() - beginTime) )
+
+                with open(log_filename, mode='a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([iter, epoch + 1, b // batchSize + 1, H.item(), words / (time.time() - trainTime), (time.time() - beginTime), bestPerplexity])
+
                 trainTime = time.time()
                 words = 0
-                
+
             if iter % test_every == 0:
                 nmt.eval()
                 currentPerplexity = perplexity(nmt, devCorpusEng, devCorpusBg, batchSize)
@@ -139,28 +144,12 @@ if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
     nmt.eval()
     currentPerplexity = perplexity(nmt, devCorpusEng, devCorpusBg, batchSize)
     print('Last model perplexity: ',currentPerplexity)
-        
-    if currentPerplexity < bestPerplexity:
-        bestPerplexity = currentPerplexity
-        print('Saving last model.')
-        nmt.save(modelFileName)
-        torch.save((iter,bestPerplexity,learning_rate,optimizer.state_dict()), modelFileName + '.optim')
 
-if len(sys.argv)>3 and sys.argv[1] == 'perplexity':
-    word2ind = pickle.load(open(wordsFileName, 'rb'))
-    
-    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
-                        endToken, lstm_layers, dropout_encoder,
-                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
-    nmt.load(modelFileName)
-    
-    sourceTest = utils.readCorpus(sys.argv[2])
-    targetTest = utils.readCorpus(sys.argv[3])
-    testEng = [ [startToken] + s + [endToken] for s in sourceTest]
-    testBg = [ [startToken] + s + [endToken] for s in targetTest]
-
-    nmt.eval()
-    print('Model perplexity: ', perplexity(nmt, testEng, testBg, batchSize))
+if currentPerplexity < bestPerplexity:
+    bestPerplexity = currentPerplexity
+    print('Saving last model.')
+    nmt.save(modelFileName)
+    torch.save((iter,bestPerplexity,learning_rate,optimizer.state_dict()), modelFileName + '.optim')
 
 if len(sys.argv)>3 and sys.argv[1] == 'translate':
     word2ind = pickle.load(open(wordsFileName, 'rb'))
@@ -169,9 +158,9 @@ if len(sys.argv)>3 and sys.argv[1] == 'translate':
     sourceTest = utils.readCorpus(sys.argv[2])
     test = [ [startToken] + s + [endToken] for s in sourceTest ]
 
-    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
-                        endToken, lstm_layers, dropout_encoder,
-                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, startToken, unkToken, padToken,
+                        endToken, transToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator).to(device)
     nmt.load(modelFileName)
 
     nmt.eval()
@@ -185,13 +174,13 @@ if len(sys.argv)>3 and sys.argv[1] == 'translate':
     pb.stop()
 
 if len(sys.argv)>2 and sys.argv[1] == 'generate':
-    word2indEng, word2indBg = pickle.load(open(wordsFileName, 'rb'))
+    (word2indEng, word2indBg) = pickle.load(open(wordsFileName, 'rb'))
 
     test = sys.argv[2]
 
-    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, unkToken, padToken,
-                        endToken, lstm_layers, dropout_encoder,
-                        dropout_translator, dropaut_generator, dropout_attention).to(device)    
+    nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, startToken, unkToken, padToken,
+                        endToken, transToken, lstm_layers, dropout_encoder,
+                        dropout_translator, dropaut_generator).to(device)
     nmt.load(modelFileName)
 
     nmt.eval()
