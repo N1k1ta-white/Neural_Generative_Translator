@@ -82,6 +82,7 @@ if len(sys.argv)>1 and (sys.argv[1] == 'train' or sys.argv[1] == 'extratrain'):
     nmt = model.LanguageModel(emd_size, hidden_size, word2indEng, word2indBg, startToken, unkToken, padToken,
                         endToken, transToken, lstm_layers, dropout_encoder,
                         dropout_translator, dropaut_generator).to(device)
+    nmt.summary()
     optimizer = torch.optim.Adam(nmt.parameters(), lr=learning_rate)
 
     if sys.argv[1] == 'extratrain':

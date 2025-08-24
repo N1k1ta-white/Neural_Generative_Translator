@@ -71,7 +71,7 @@ class Encoder(nn.Module):
 
         outputPacked, (hidden, cell) = self.rnn(packed)  # outputPacked: (batch_size, seq_len, 2 * hidden_size)
 
-        output, _ = torch.nn.utils.rnn.pad_packed_sequence(outputPacked)  # (batch_size, seq_len, 2 * hidden_size)
+        output, _ = torch.nn.utils.rnn.pad_packed_sequence(outputPacked, batch_first=True)  # (batch_size, seq_len, 2 * hidden_size)
 
         return output, (hidden, cell)
 
@@ -102,18 +102,19 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, hidden, cell, encoder_outputs, mask):
-        # hidden (num_layers, batch_size, hidden_size)
-        # cell (num_layers, batch_size, hidden_size)
-        # encoders_outputs (batch_size, seq_len - 1, hidden_size * 2)
-        # mask (seq_len ,batch_size)
+        # x: (batch_size)
+        # hidden: (num_layers, batch_size, hidden_size)
+        # cell: (num_layers, batch_size, hidden_size)
+        # encoder_outputs: (batch_size, seq_len, hidden_size * 2)
+        # mask: (batch_size, seq_len)
 
         enc_output = encoder_outputs[:, :, :self.hidden_size] + encoder_outputs[:, :, self.hidden_size:] # (batch_size, seq_len, hidden_size)
 
-        x = x.unsqueeze(0)  # (1, batch_size)
+        x = x.unsqueeze(1)  # (batch_size, 1)
 
-        e = self.dropout(self.embedding(x)) # (1, batch_size, embedding_size)
+        e = self.dropout(self.embedding(x)) # (batch_size, 1, embedding_size)
 
-        hidden_attention = hidden[-1] if self.num_layers > 1 else hidden.squeeze(0)  # (batch_size, hidden_size)
+        hidden_attention = hidden[-1]  # (batch_size, hidden_size)
 
         att = self.attention(hidden_attention, enc_output, mask)  # (batch_size, seq_len)
 
@@ -121,24 +122,19 @@ class Decoder(nn.Module):
 
         weighted = torch.bmm(att, enc_output)  # (batch_size, 1, hidden_size)
 
-        weighted = weighted.permute(1, 0, 2)  # (1, batch_size, hidden_size)
-
-        rnn_input = torch.cat((e, weighted), dim=2)  # (1, batch_size, hidden_size + embedding_size)
-
-        rnn_input = rnn_input.transpose(1, 0)
+        rnn_input = torch.cat((e, weighted), dim=2)  # (batch_size, 1, hidden_size + embedding_size)
 
         output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))  # output: (batch_size, 1, hidden_size)
-        output = output.transpose(1, 0)
 
-        e = e.squeeze(0)
-        output = output.squeeze(0)
-        weighted = weighted.squeeze(0)
+        e = e.squeeze(1)
+        output = output.squeeze(1)
+        weighted = weighted.squeeze(1)
 
         prediction = self.fc(torch.cat((torch.mul(output, weighted), e), dim = 1))
 
         # prediction : (batch_size, vocab_size)
 
-        return prediction, hidden.squeeze(0), cell.squeeze(0)
+        return prediction, hidden, cell
 
 class Seq2Seq(nn.Module):
     def __init__(self, decoder, padTokenIdx):
@@ -233,15 +229,19 @@ class LanguageModel(torch.nn.Module):
 
     def preparePaddedBatch(self, source):
         device = next(self.parameters()).device
-        m = max(len(s) for s in source)
-        sents_padded = [s + (m - len(s))*[self.padTokenIdx] for s in source]
-        return torch.tensor(sents_padded, dtype=torch.long, device=device)	# shape=(batch_size, seq_len)
+        source_tensors = [torch.tensor(s, dtype=torch.long) for s in source]
+        sents_padded = torch.nn.utils.rnn.pad_sequence(source_tensors, batch_first=True, padding_value=self.padTokenIdx)
+        return sents_padded.to(device)
 
     def save(self,fileName):
         torch.save(self.state_dict(), fileName)
 
     def load(self,fileName, map_location = torch.device("cuda:0")):
         self.load_state_dict(torch.load(fileName, map_location))
+
+    def summary(self):
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Model Summary: Total trainable parameters: {total_params:,}")
 
     def create_mask(self, src):
         mask = (src != self.padTokenIdx)
@@ -254,7 +254,6 @@ class LanguageModel(torch.nn.Module):
         engLength = [len(s) - 1 for s in engBatch]
 
         encoder_outputs, (hidden, cell) = self.encoder(engBatchPadded, engLength)
-        encoder_outputs.transpose_(0, 1)  # (seq_len, batch_size, 2 * hidden_size)
 
         encoder_outputs = self.dropout(encoder_outputs)
 
@@ -281,7 +280,8 @@ class LanguageModel(torch.nn.Module):
         w1, w2 = weights[0], weights[1]
 
         # Update task weights
-        self.task_weights.data = torch.tensor([w1, w2]).to(self.task_weights.device)
+        with torch.no_grad():
+            self.task_weights.copy_(torch.stack([w1, w2]))
 
         # Store current losses for next iteration
         self.prev_losses = [L1.detach(), L2.detach()]
@@ -314,7 +314,6 @@ class LanguageModel(torch.nn.Module):
 
         with torch.no_grad():
             encoder_outputs, (hiddenEn, cellEn) = self.encoder.executeThrowRnn(src_tensor, src_len)
-            encoder_outputs = encoder_outputs.transpose(1, 0)
             mask = self.create_mask(src_tensor)
 
             num_layers, batch, size = hiddenEn.shape
@@ -339,9 +338,6 @@ class LanguageModel(torch.nn.Module):
                 if next_token == self.endTokenIdx:
                     break
 
-                encoder_output, (hiddenEn, cellEn) = self.encoder.forward_step(input.unsqueeze(1), hiddenEn, cellEn)
-                encoder_outputs = torch.cat((encoder_outputs, encoder_output), dim = 1)
-                mask = torch.cat((mask, torch.tensor([[True]], device=device)), dim = 1)
                 output, hidden, cell = self.TextGenerator.decoder(input, hidden, cell, encoder_outputs, mask)
 
                 prediction = torch.softmax(output / temperature, dim=-1)
@@ -369,7 +365,6 @@ class LanguageModel(torch.nn.Module):
         self.eval()
         with torch.no_grad():
             encoder_outputs, (hidden, cell) = self.encoder(src_tensor, src_len)
-            encoder_outputs = encoder_outputs.transpose(1, 0)
             mask = self.create_mask(src_tensor)
 
             input = torch.tensor([self.startTokenIdx], dtype=torch.long, device=device)
