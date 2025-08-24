@@ -130,9 +130,12 @@ class Decoder(nn.Module):
         output = output.squeeze(1)
         weighted = weighted.squeeze(1)
 
+        # The prediction is based on a combination of the decoder's output,
+        # the context vector (weighted), and the embedding of the previous token (e).
+        # Note the non-standard use of element-wise multiplication between output and weighted.
         prediction = self.fc(torch.cat((torch.mul(output, weighted), e), dim = 1))
 
-        # prediction : (batch_size, vocab_size)
+        # prediction: (batch_size, vocab_size)
 
         return prediction, hidden, cell
 
@@ -247,6 +250,30 @@ class LanguageModel(torch.nn.Module):
         mask = (src != self.padTokenIdx)
         return mask[:, 1:]         # (batch_size, seq_len)
 
+    def _calculate_weighted_loss(self, generation_loss, translation_loss):
+        """Calculates the weighted sum of losses using a GradNorm-like approach."""
+        # Calculate relative inverse training rates
+        r_gen = (generation_loss / self.prev_losses[0].detach()).detach()
+        r_trans = (translation_loss / self.prev_losses[1].detach()).detach()
+        r_mean = torch.mean(torch.tensor([r_gen, r_trans]))
+
+        # Update weights using GradNorm
+        w_gen = self.task_weights[0] * (r_gen / r_mean)
+        w_trans = self.task_weights[1] * (r_trans / r_mean)
+
+        # Normalize weights
+        weights = torch.softmax(torch.stack([w_gen, w_trans]), dim=0)
+
+        # Update task weights for the next iteration
+        with torch.no_grad():
+            self.task_weights.copy_(weights)
+
+        # Store current losses for next iteration
+        self.prev_losses = [generation_loss.detach(), translation_loss.detach()]
+
+        # Return weighted sum of losses
+        return weights[0] * generation_loss + weights[1] * translation_loss
+
     def forward(self, engBatch, bgBatch):
         engBatchPadded = self.preparePaddedBatch(engBatch)
         bgBatchPadded = self.preparePaddedBatch(bgBatch)
@@ -259,38 +286,34 @@ class LanguageModel(torch.nn.Module):
 
         mask = self.create_mask(engBatchPadded)
 
+        # The generator part of the model does not get the encoder's final state
         hiddenGen = torch.zeros_like(hidden)
         cellGen= torch.zeros_like(cell)
 
-        # Current losses
-        L1 = self.TextGenerator(engBatchPadded, encoder_outputs, hiddenGen, cellGen, mask)  # Generation loss
-        L2 = self.Seq2Seq(bgBatchPadded, encoder_outputs, hidden, cell, mask)  # Translation loss
+        # Calculate losses for the two tasks
+        generation_loss = self.TextGenerator(engBatchPadded, encoder_outputs, hiddenGen, cellGen, mask)
+        translation_loss = self.Seq2Seq(bgBatchPadded, encoder_outputs, hidden, cell, mask)
 
-        # Calculate relative inverse training rates
-        r1 = (L1 / self.prev_losses[0].detach()).detach()
-        r2 = (L2 / self.prev_losses[1].detach()).detach()
-        r_mean = torch.mean(torch.tensor([r1, r2]))
-
-        # Update weights using GradNorm
-        w1 = self.task_weights[0] * (r1 / r_mean)
-        w2 = self.task_weights[1] * (r2 / r_mean)
-
-        # Normalize weights
-        weights = torch.softmax(torch.stack([w1, w2]), dim=0)
-        w1, w2 = weights[0], weights[1]
-
-        # Update task weights
-        with torch.no_grad():
-            self.task_weights.copy_(torch.stack([w1, w2]))
-
-        # Store current losses for next iteration
-        self.prev_losses = [L1.detach(), L2.detach()]
-
-        # Return weighted sum of losses
-        return w1 * L1 + w2 * L2
+        return self._calculate_weighted_loss(generation_loss, translation_loss)
 
     def isCompleteSentence(self, prefix):
         return self.transToken in prefix
+
+    def _generate_sequence(self, decoder, input_token, hidden, cell, encoder_outputs, mask, max_len, temperature):
+        """Helper function for auto-regressive sequence generation."""
+        generated_indices = []
+        for _ in range(max_len):
+            output, hidden, cell = decoder(input_token, hidden, cell, encoder_outputs, mask)
+            prediction = torch.softmax(output / temperature, dim=-1)
+            input_token = torch.multinomial(prediction, 1).squeeze(1)
+
+            token_idx = input_token.item()
+            generated_indices.append(token_idx)
+
+            if token_idx == self.endTokenIdx:
+                break
+
+        return generated_indices
     
     def genereate(self, prefix, temperature = 0.5):
         if (self.isCompleteSentence(prefix)):
@@ -330,23 +353,22 @@ class LanguageModel(torch.nn.Module):
                 input = src_tensor[:, t]
 
             prediction = torch.softmax(output / temperature, dim=-1)
-            input = torch.multinomial(prediction, 1)
-            input = input.squeeze(1)
-            next_token = input.item()
+            input_token = torch.multinomial(prediction, 1).squeeze(1)
 
-            for t in range(1, max_len):
-                if next_token == self.endTokenIdx:
-                    break
+            next_token_idx = input_token.item()
+            generated.append(next_token_idx)
 
-                output, hidden, cell = self.TextGenerator.decoder(input, hidden, cell, encoder_outputs, mask)
-
-                prediction = torch.softmax(output / temperature, dim=-1)
-
-                input = torch.multinomial(prediction, 1)
-                input = input.squeeze(1)
-
-                next_token = input.item()
-                generated.append(next_token)
+            if next_token_idx != self.endTokenIdx:
+                generated.extend(self._generate_sequence(
+                    decoder=self.TextGenerator.decoder,
+                    input_token=input_token,
+                    hidden=hidden,
+                    cell=cell,
+                    encoder_outputs=encoder_outputs,
+                    mask=mask,
+                    max_len=max_len - 1,
+                    temperature=temperature
+                ))
 
         self.train()
         return prefix + spEng.decode(generated)
@@ -367,21 +389,17 @@ class LanguageModel(torch.nn.Module):
             encoder_outputs, (hidden, cell) = self.encoder(src_tensor, src_len)
             mask = self.create_mask(src_tensor)
 
-            input = torch.tensor([self.startTokenIdx], dtype=torch.long, device=device)
-
-            for t in range(1, max_len):
-                output, hidden, cell = self.Seq2Seq.decoder(input, hidden, cell, encoder_outputs, mask)
-
-                prediction = torch.softmax(output / temperature, dim=-1)
-
-                input = torch.multinomial(prediction, 1)
-                input = input.squeeze(1)
-
-                next_token = input.item()
-                generated.append(next_token)
-
-                if next_token == self.endTokenIdx:
-                    break
+            input_token = torch.tensor([self.startTokenIdx], dtype=torch.long, device=device)
+            generated = self._generate_sequence(
+                decoder=self.Seq2Seq.decoder,
+                input_token=input_token,
+                hidden=hidden,
+                cell=cell,
+                encoder_outputs=encoder_outputs,
+                mask=mask,
+                max_len=max_len,
+                temperature=temperature
+            )
 
         self.train()
         return spBg.decode(generated)

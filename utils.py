@@ -33,19 +33,6 @@ def train_bpe(corpus_file, model_prefix, vocab_size=8000):
         )
 
 
-def get_word2ind(sp_model):
-    trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng, sp_source, sp_target = prepareDataBPE(sourceFileName, targetFileName, sourceDevFileName, targetDevFileName, bpe_Eng, bpe_Bg)
-    word2indBg = get_word2ind(sp_target)
-    word2indEng = get_word2ind(sp_source)
-
-    pickle.dump((trainCorpusBg, trainCorpusEng, devCorpusBg, devCorpusEng), open(corpusFileName, 'wb'))
-    pickle.dump((word2indEng, word2indBg), open(wordsFileName, 'wb'))
-
-    print('Data prepared.')
-
-# train_bpe(bg, "bul", 40000)
-# train_bpe(eng, "eng", 30000)
-
 class progressBar:
     def __init__(self ,barWidth = 50):
         self.barWidth = barWidth
